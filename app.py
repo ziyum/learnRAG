@@ -30,6 +30,51 @@ def is_ollama_model(model_name: str) -> bool:
     return model_name == "gemma4:12b"
 
 
+def normalize_usage(usage):
+    if not usage or not isinstance(usage, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)),
+    }
+
+
+def extract_content_from_response(result):
+    if isinstance(result, dict):
+        choice = result.get("choices", [{}])[0]
+        message = choice.get("message") if isinstance(choice, dict) else None
+        return (message or {}).get("content", "") or str(choice)
+    if hasattr(result, "choices"):
+        choice = result.choices[0]
+        if hasattr(choice, "message"):
+            return getattr(choice.message, "content", "")
+        return getattr(choice, "text", "") or str(choice)
+    return str(result)
+
+
+def get_response_usage(result):
+    if isinstance(result, dict):
+        return normalize_usage(result.get("usage", {}))
+    if hasattr(result, "usage"):
+        usage = getattr(result, "usage")
+        if isinstance(usage, dict):
+            return normalize_usage(usage)
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def update_token_usage(provider, usage, estimated):
+    usage = normalize_usage(usage)
+    total = usage["total_tokens"] or (usage["prompt_tokens"] + usage["completion_tokens"])
+    st.session_state.token_usage["last_request"] = usage["prompt_tokens"] or estimated
+    st.session_state.token_usage["last_response"] = usage["completion_tokens"]
+    st.session_state.token_usage["last_total"] = total
+    st.session_state.token_usage["total_by_provider"][provider] = (
+        st.session_state.token_usage["total_by_provider"].get(provider, 0) + total
+    )
+    st.session_state.token_usage["estimated_total"] += estimated
+
+
 def call_deepseek_chat(model, messages):
     endpoint = "https://api.deepseek.com/v1/chat/completions"
     headers = {
@@ -46,12 +91,20 @@ def call_deepseek_chat(model, messages):
     if not isinstance(data, dict) or "choices" not in data or not data["choices"]:
         raise ValueError("Deepseek returned an unexpected response")
     content = data["choices"][0].get("message", {}).get("content", "")
-    return content
+    return content, normalize_usage(data.get("usage", {}))
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "rag_chunks" not in st.session_state:
     st.session_state.rag_chunks = []
+if "token_usage" not in st.session_state:
+    st.session_state.token_usage = {
+        "last_request": 0,
+        "last_response": 0,
+        "last_total": 0,
+        "total_by_provider": {"openai": 0, "deepseek": 0, "ollama": 0},
+        "estimated_total": 0,
+    }
 
 
 def extract_sections(soup):
@@ -101,7 +154,20 @@ def chunk_section(text, heading, max_words=250, overlap_words=30):
 
 def scrape_url(url):
     """Scrape a URL and return heading-aware semantic chunks."""
-    resp = requests.get(url, timeout=10)
+    cleaned_url = url.strip()
+    if not cleaned_url.lower().startswith(("http://", "https://")):
+        cleaned_url = "https://" + cleaned_url
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+    }
+
+    resp = requests.get(cleaned_url, timeout=10, headers=headers)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
@@ -149,8 +215,15 @@ def count_tokens_for_messages(messages, model_name):
         encoder = tiktoken.get_encoding("cl100k_base")
 
     total = 0
+    is_openai_chat = model_name.startswith("gpt-")
     for message in messages:
         total += len(encoder.encode(message.get("content", "")))
+        if is_openai_chat:
+            total += 4
+            if message.get("name"):
+                total += -1
+    if is_openai_chat:
+        total += 3
     return total
 
 
@@ -192,11 +265,23 @@ with st.sidebar:
     if is_deepseek_model(model) and not deepseek_api_key:
         st.warning("Deepseek API key missing in .streamlit/secrets.toml")
 
-    st.metric("Estimated conversation tokens", count_tokens_for_messages(
+    estimated_tokens = count_tokens_for_messages(
         [{"role": "system", "content": system_prompt}] + st.session_state.messages,
         model,
-    ))
+    )
 
+    cols = st.columns(2)
+    cols[0].metric("Estimated conversation tokens", estimated_tokens)
+    cols[1].metric("Last API total tokens", st.session_state.token_usage["last_total"])
+    st.metric("Last request tokens", st.session_state.token_usage["last_request"])
+    st.metric("Last response tokens", st.session_state.token_usage["last_response"])
+    st.caption(
+        "API totals: OpenAI={} | Deepseek={} | Ollama={}".format(
+            st.session_state.token_usage["total_by_provider"]["openai"],
+            st.session_state.token_usage["total_by_provider"]["deepseek"],
+            st.session_state.token_usage["total_by_provider"]["ollama"],
+        )
+    )
     st.caption("Default model is Ollama gemma4:12b. Deepseek and OpenAI are paid via their respective APIs.")
 
     st.divider()
@@ -212,8 +297,8 @@ with st.sidebar:
                     st.session_state.rag_chunks.append({"url": url, "chunks": chunks})
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Failed to scrape {url}")
-                    print(f"Scrape error: {e}")
+                    st.error(f"Failed to scrape {url}: {e}")
+                    print(f"Scrape error for {url}: {e}")
 
     for i, source in enumerate(st.session_state.rag_chunks):
         cols = st.columns([4, 1])
@@ -255,28 +340,34 @@ if prompt := st.chat_input("Type your message..."):
     ]
 
     with st.chat_message("assistant"):
+        response = ""
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         try:
             if is_ollama_model(model):
                 client = ollama_client
-                stream = client.chat.completions.create(
+                result = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    stream=True,
+                    stream=False,
                 )
-                response = st.write_stream(stream)
+                response = extract_content_from_response(result)
+                usage = get_response_usage(result)
+                st.markdown(response)
             elif is_openai_model(model):
                 if not openai_client:
                     raise ValueError("OpenAI API key is not configured.")
-                stream = openai_client.chat.completions.create(
+                result = openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    stream=True,
+                    stream=False,
                 )
-                response = st.write_stream(stream)
+                response = extract_content_from_response(result)
+                usage = get_response_usage(result)
+                st.markdown(response)
             else:
                 if not deepseek_api_key:
                     raise ValueError("Deepseek API key is not configured.")
-                response = call_deepseek_chat(model, messages)
+                response, usage = call_deepseek_chat(model, messages)
                 if response:
                     st.markdown(response)
                 else:
@@ -285,4 +376,10 @@ if prompt := st.chat_input("Type your message..."):
             st.error("Sorry, something went wrong. Please try again.")
             print(f"API error: {e}")
             response = "I encountered an error processing your request."
+        finally:
+            update_token_usage(
+                "openai" if is_openai_model(model) else "deepseek" if is_deepseek_model(model) else "ollama",
+                usage,
+                count_tokens_for_messages(messages, model),
+            )
     st.session_state.messages.append({"role": "assistant", "content": response})
