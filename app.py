@@ -1,15 +1,52 @@
+import json
 import re
 import streamlit as st
 from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
+import tiktoken
 
-st.title("AI Chatbot")
+st.title("Customizable Chatbot")
 
 ollama_client = OpenAI(
     api_key="ollama",
     base_url="http://100.106.58.49:11434/v1",
 )
+
+openai_api_key = st.secrets.get("OPENAI_API_KEY", "")
+deepseek_api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
+
+openai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
+
+def is_openai_model(model_name: str) -> bool:
+    return model_name.startswith("gpt-")
+
+
+def is_deepseek_model(model_name: str) -> bool:
+    return model_name.startswith("deepseek-")
+
+
+def is_ollama_model(model_name: str) -> bool:
+    return model_name == "gemma4:12b"
+
+
+def call_deepseek_chat(model, messages):
+    endpoint = "https://api.deepseek.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {deepseek_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or "choices" not in data or not data["choices"]:
+        raise ValueError("Deepseek returned an unexpected response")
+    content = data["choices"][0].get("message", {}).get("content", "")
+    return content
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -104,17 +141,63 @@ def retrieve_relevant(query, chunks, max_words=3000):
     return selected if selected else chunks[:3]
 
 
+def count_tokens_for_messages(messages, model_name):
+    """Estimate token usage for a list of role/content messages."""
+    try:
+        encoder = tiktoken.encoding_for_model(model_name)
+    except Exception:
+        encoder = tiktoken.get_encoding("cl100k_base")
+
+    total = 0
+    for message in messages:
+        total += len(encoder.encode(message.get("content", "")))
+    return total
+
+
+if "system_prompt" not in st.session_state:
+    st.session_state.system_prompt = "You are a helpful assistant."
+
 with st.sidebar:
     st.header("⚙️ Settings")
-    system_prompt = st.text_area(
-        "System Prompt",
-        value="You are a helpful assistant.",
-    )
+
+    with st.form("system_prompt_form"):
+        system_prompt = st.text_area(
+            "System Prompt",
+            value=st.session_state.system_prompt,
+            key="system_prompt_text",
+        )
+        submitted = st.form_submit_button("Submit")
+
+    if submitted:
+        st.session_state.system_prompt = system_prompt
+        st.success("System prompt updated.")
+
+    system_prompt = st.session_state.system_prompt
+
     model = st.selectbox(
         "Model",
-        options=["gemma4:12b"],
+        options=[
+            "gemma4:12b",
+            "gpt-4o-mini",
+            "gpt-4.1-mini",
+            "gpt-3.5-turbo",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        ],
         index=0,
     )
+
+    if is_openai_model(model) and not openai_api_key:
+        st.warning("OpenAI API key missing in .streamlit/secrets.toml")
+    if is_deepseek_model(model) and not deepseek_api_key:
+        st.warning("Deepseek API key missing in .streamlit/secrets.toml")
+
+    st.metric("Estimated conversation tokens", count_tokens_for_messages(
+        [{"role": "system", "content": system_prompt}] + st.session_state.messages,
+        model,
+    ))
+
+    st.caption("Default model is Ollama gemma4:12b. Deepseek and OpenAI are paid via their respective APIs.")
 
     st.divider()
     st.header("📚 RAG Sources")
@@ -166,19 +249,38 @@ if prompt := st.chat_input("Type your message..."):
         rag_context = ""
 
     full_system_prompt = f"{system_prompt}\n\n{rag_context}" if rag_context else system_prompt
+    messages = [
+        {"role": "system", "content": full_system_prompt},
+        *st.session_state.messages,
+    ]
 
     with st.chat_message("assistant"):
         try:
-            client = ollama_client
-            stream = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": full_system_prompt},
-                    *st.session_state.messages,
-                ],
-                stream=True,
-            )
-            response = st.write_stream(stream)
+            if is_ollama_model(model):
+                client = ollama_client
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                )
+                response = st.write_stream(stream)
+            elif is_openai_model(model):
+                if not openai_client:
+                    raise ValueError("OpenAI API key is not configured.")
+                stream = openai_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                )
+                response = st.write_stream(stream)
+            else:
+                if not deepseek_api_key:
+                    raise ValueError("Deepseek API key is not configured.")
+                response = call_deepseek_chat(model, messages)
+                if response:
+                    st.markdown(response)
+                else:
+                    st.warning("Deepseek returned an empty response.")
         except Exception as e:
             st.error("Sorry, something went wrong. Please try again.")
             print(f"API error: {e}")
